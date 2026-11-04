@@ -62,6 +62,22 @@ WAF_BYPASS_HEADERS = [
     "X-Remote-Addr: 127.0.0.1",
 ]
 
+# Low-and-slow HTTP rate limits (req/s) — WAF-evasion defaults, tune per
+# engagement. ferox/nuclei/katana were already conservative; httpx was not.
+HTTPX_RATE_LIMIT = os.environ.get("HTTPX_RATE_LIMIT", "20")
+HTTPX_THREADS = os.environ.get("HTTPX_THREADS", "20")
+FEROX_RATE_LIMIT = os.environ.get("FEROX_RATE_LIMIT", "10")
+NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "5")
+
+# Generous tool timeouts (seconds) — hang-guards, not truncation targets. On
+# timeout the pipeline keeps partial results and warns instead of failing.
+SUBFINDER_TIMEOUT = int(os.environ.get("SUBFINDER_TIMEOUT", "7200"))
+DNSX_TIMEOUT = int(os.environ.get("DNSX_TIMEOUT", "3600"))
+HTTPX_TIMEOUT = int(os.environ.get("HTTPX_TIMEOUT", "7200"))
+KATANA_TIMEOUT = int(os.environ.get("KATANA_TIMEOUT", "7200"))
+FEROX_TIMEOUT = int(os.environ.get("FEROX_TIMEOUT", "14400"))
+NUCLEI_TIMEOUT = int(os.environ.get("NUCLEI_TIMEOUT", "14400"))
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 def now() -> str:
@@ -97,6 +113,21 @@ def alert(msg: str) -> None:
 def ai_enabled() -> bool:
     """True when the AI layer (Hermes recon profile) is enabled via AI_ENABLED=1."""
     return os.environ.get("AI_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _run_tool(cmd: list[str], timeout: int, **kw) -> subprocess.CompletedProcess | None:
+    """Run a tool with a generous timeout; on timeout keep partial output + warn.
+
+    The caller typically passes stdout=<file>, so partial content survives a
+    TimeoutExpired. We warn and return None so the phase continues instead of
+    failing the whole domain.
+    """
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        print(f"[!] {cmd[0]} timed out after {timeout}s — keeping partial results",
+              file=sys.stderr)
+        return None
 
 
 def docker_exec(*args: str, stdin_text: str | None = None, timeout: int | None = None,
@@ -259,6 +290,7 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
 
     # Clear stale discovery artifacts (after the baseline snapshot above)
     _clear_artifacts(d, ["subfinder.txt", "crtsh.txt", "dnsx_brute.txt",
+                         "resolved_subdomains.txt",
                          "live_hosts.json", "live_subdomains.txt",
                          "suggested_subs.txt", "suggested_subs_ai.txt",
                          "suggested_live.json", "suggested_live.txt", "tech_summary.txt"])
@@ -280,9 +312,10 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
         f"-w '%{{http_code}}' 'https://crt.sh/?q=%25.{domain}&output=json'",
         capture=True,
     ).stdout.strip()
-    subprocess.run(
+    _run_tool(
         ["docker", "exec", "-i", CONTAINER, "subfinder", "-d", domain, "-silent"],
-        stdout=(d / "subfinder.txt").open("w"), stderr=subprocess.DEVNULL, timeout=900,
+        SUBFINDER_TIMEOUT,
+        stdout=(d / "subfinder.txt").open("w"), stderr=subprocess.DEVNULL,
     )
     (d / "root_domain.txt").write_text(domain + "\n")
 
@@ -297,17 +330,20 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
         print(f"[!] crt.sh blocked (HTTP {crtsh_code})")
 
     # dnsx brute
-    subprocess.run(
+    _run_tool(
         ["docker", "exec", "-i", CONTAINER, "dnsx", "-d", domain,
          "-w", "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt", "-silent"],
-        stdout=(d / "dnsx_brute.txt").open("w"), stderr=subprocess.DEVNULL, timeout=600,
+        DNSX_TIMEOUT,
+        stdout=(d / "dnsx_brute.txt").open("w"), stderr=subprocess.DEVNULL,
     )
 
-    # Merge all subdomain sources
+    # Merge + sanitize all subdomain sources: lowercase, drop cert-log noise
+    # (wildcards, emails, leading dashes), dedupe.
     docker_exec_bash(
         f"cat /app/output/{domain}/monthly/subfinder.txt "
         f"/app/output/{domain}/monthly/crtsh.txt "
-        f"/app/output/{domain}/monthly/dnsx_brute.txt 2>/dev/null | sort -u "
+        f"/app/output/{domain}/monthly/dnsx_brute.txt 2>/dev/null "
+        f"| tr '[:upper:]' '[:lower:]' | grep -vE '^[*@-]|@' | sort -u "
         f"> /app/output/{domain}/monthly/all_subdomains.txt"
     )
     subs = line_count(d / "all_subdomains.txt")
@@ -318,12 +354,23 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
         '&& kill "${p##*/}" 2>/dev/null; done'
     )
 
+    # Resolve candidates with dnsx first (fast concurrent DNS) so httpx only
+    # probes hosts that actually resolve. Prevents junk-heavy domains (e.g.
+    # example.com's ~43K cert-log entries) from drowning httpx.
+    _run_tool(
+        ["docker", "exec", "-i", CONTAINER, "dnsx",
+         "-l", f"/app/output/{domain}/monthly/all_subdomains.txt", "-silent"],
+        DNSX_TIMEOUT,
+        stdout=(d / "resolved_subdomains.txt").open("w"), stderr=subprocess.DEVNULL,
+    )
+
     # httpx liveness (tech-detect + CDN detection feed synthesis + WAF envelope)
-    subprocess.run(
+    _run_tool(
         ["docker", "exec", "-i", CONTAINER, "httpx",
-         "-list", f"/app/output/{domain}/monthly/all_subdomains.txt",
-         "-td", "-cdn", "-silent", "-json", "-o", f"/app/output/{domain}/monthly/live_hosts.json"],
-        stderr=subprocess.DEVNULL, timeout=1200,
+         "-list", f"/app/output/{domain}/monthly/resolved_subdomains.txt",
+         "-td", "-cdn", "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+         "-o", f"/app/output/{domain}/monthly/live_hosts.json"],
+        HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
     )
     docker_exec_bash(
         f"cat /app/output/{domain}/monthly/live_hosts.json | "
@@ -349,11 +396,12 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
         _merge_lines(d / "suggested_subs.txt", d / "suggested_subs_ai.txt")
     suggested = line_count(d / "suggested_subs.txt")
     if suggested > 0:
-        subprocess.run(
+        _run_tool(
             ["docker", "exec", "-i", CONTAINER, "httpx",
              "-list", f"/app/output/{domain}/monthly/suggested_subs.txt",
-             "-silent", "-json", "-o", f"/app/output/{domain}/monthly/suggested_live.json"],
-            stderr=subprocess.DEVNULL, timeout=1200,
+             "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+             "-o", f"/app/output/{domain}/monthly/suggested_live.json"],
+            HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
         )
         docker_exec_bash(
             f"cat /app/output/{domain}/monthly/suggested_live.json 2>/dev/null | "
@@ -417,12 +465,12 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
                          "x8_results.json", "auth_endpoints.txt"])
 
     # katana crawl
-    subprocess.run(
+    _run_tool(
         ["docker", "exec", "-i", CONTAINER, "katana",
          "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
          "-jc", "-d", str(KATANA_DEPTH), "-c", "5", "--delay", "2", "-silent",
          "-o", f"/app/output/{domain}/monthly/katana_urls.txt"],
-        stderr=subprocess.DEVNULL, timeout=1800,
+        KATANA_TIMEOUT, stderr=subprocess.DEVNULL,
     )
 
     # gau (bounded)
@@ -455,19 +503,19 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
 
     # feroxbuster — monthly only (the ~10-16h part); stdin passed CORRECTLY
     if mode == "monthly":
-        subprocess.run(
+        _run_tool(
             ["docker", "exec", "-i", CONTAINER, "feroxbuster", "--stdin",
-             "--rate-limit", "10", "--random-agent", "--json", "-t", "10",
+             "--rate-limit", FEROX_RATE_LIMIT, "--random-agent", "--json", "-t", "10",
              "-w", "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
              "-n", "-o", f"/app/output/{domain}/monthly/ferox_results_full.json"],
-            input="\n".join(targets), text=True, stderr=subprocess.DEVNULL, timeout=7200,
+            FEROX_TIMEOUT, input="\n".join(targets), text=True, stderr=subprocess.DEVNULL,
         )
-        subprocess.run(
+        _run_tool(
             ["docker", "exec", "-i", CONTAINER, "feroxbuster", "--stdin",
-             "--rate-limit", "10", "--random-agent", "--json", "-t", "10",
+             "--rate-limit", FEROX_RATE_LIMIT, "--random-agent", "--json", "-t", "10",
              "-w", "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
              "--depth", "2", "-o", f"/app/output/{domain}/monthly/ferox_results_deep.json"],
-            input="\n".join(targets[:10]), text=True, stderr=subprocess.DEVNULL, timeout=7200,
+            FEROX_TIMEOUT, input="\n".join(targets[:10]), text=True, stderr=subprocess.DEVNULL,
         )
 
     # Comprehensive URL set (ferox contributes only on monthly)
@@ -507,11 +555,12 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
                     str(d / "suggested_endpoints_ai.txt"))
         _merge_lines(d / "suggested_endpoints.txt", d / "suggested_endpoints_ai.txt")
     if line_count(d / "suggested_endpoints.txt") > 0:
-        subprocess.run(
+        _run_tool(
             ["docker", "exec", "-i", CONTAINER, "httpx",
              "-list", f"/app/output/{domain}/monthly/suggested_endpoints.txt",
-             "-silent", "-json", "-o", f"/app/output/{domain}/monthly/endpoints_live.json"],
-            stderr=subprocess.DEVNULL, timeout=1200,
+             "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+             "-o", f"/app/output/{domain}/monthly/endpoints_live.json"],
+            HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
         )
         docker_exec_bash(
             f"cat /app/output/{domain}/monthly/endpoints_live.json 2>/dev/null | "
@@ -583,33 +632,33 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
 
     print("[*] Phase 3: Vulnerability Scan")
     if mode == "monthly":
-        subprocess.run(["docker", "exec", "-i", CONTAINER, "nuclei", "-update-templates", "-silent"],
-                       stderr=subprocess.DEVNULL, timeout=3600)
+        _run_tool(["docker", "exec", "-i", CONTAINER, "nuclei", "-update-templates", "-silent"],
+                  NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL)
 
     hdrs = [h.format(domain=domain) for h in WAF_BYPASS_HEADERS]
     header_args = []
     for h in hdrs:
         header_args += ["-H", h]
-    nuclei_args = ["-rl", "5", "-bs", "2", "-c", "5", "-silent", "-jsonl"] + header_args
+    nuclei_args = ["-rl", NUCLEI_RATE_LIMIT, "-bs", "2", "-c", "5", "-silent", "-jsonl"] + header_args
 
     # Pass 1: targeted (high-value, critical+high)
-    subprocess.run(
+    _run_tool(
         ["docker", "exec", "-i", CONTAINER, "nuclei",
          "-list", f"/app/output/{domain}/monthly/high_value_targets.txt",
          "-t", *NUCLEI_TARGETED_TEMPLATES.split(), "-severity", "critical,high",
          *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_targeted.json"],
-        stderr=subprocess.DEVNULL, timeout=3600,
+        NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL,
     )
     (d / "nuclei_targeted.json").touch()
 
     # Pass 2: broad (all live, critical) — monthly only
     if mode == "monthly":
-        subprocess.run(
+        _run_tool(
             ["docker", "exec", "-i", CONTAINER, "nuclei",
              "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
              "-t", *NUCLEI_BROAD_TEMPLATES.split(), "-severity", "critical",
              *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_broad.json"],
-            stderr=subprocess.DEVNULL, timeout=3600,
+            NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL,
         )
         (d / "nuclei_broad.json").touch()
 
