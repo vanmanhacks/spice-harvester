@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,21 +70,26 @@ HTTPX_THREADS = os.environ.get("HTTPX_THREADS", "20")
 FEROX_RATE_LIMIT = os.environ.get("FEROX_RATE_LIMIT", "10")
 NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "5")
 
+# Progress-based hang guards (seconds of no output growth before a tool is
+# killed) — replaces wall-clock timeouts so monthly scans can run "low and
+# slow" indefinitely. A tool is killed only when it stalls, or after the
+# ABSOLUTE_TIMEOUT last-resort ceiling. Partial output is always kept.
+STALL_HTTPX = int(os.environ.get("STALL_HTTPX", "600"))
+STALL_FEROX = int(os.environ.get("STALL_FEROX", "600"))
+STALL_NUCLEI = int(os.environ.get("STALL_NUCLEI", "600"))
+STALL_KATANA = int(os.environ.get("STALL_KATANA", "600"))
+STALL_SUBFINDER = int(os.environ.get("STALL_SUBFINDER", "1200"))
+STALL_DNSX = int(os.environ.get("STALL_DNSX", "1200"))
+ABSOLUTE_TIMEOUT = int(os.environ.get("ABSOLUTE_TIMEOUT", "86400"))
+POLL_INTERVAL = 15
+STATUS_INTERVAL = 30
+
 # Optional TLS client-hello (JA3) randomization — evades Go-fingerprint bot
 # detection. Experimental: enable with TLS_IMPERSONATE=1 for bot-walled targets.
 TLS_IMPERSONATE_FLAGS = (
     ["-tlsi"] if os.environ.get("TLS_IMPERSONATE", "").strip().lower() in ("1", "true", "yes", "on")
     else []
 )
-
-# Generous tool timeouts (seconds) — hang-guards, not truncation targets. On
-# timeout the pipeline keeps partial results and warns instead of failing.
-SUBFINDER_TIMEOUT = int(os.environ.get("SUBFINDER_TIMEOUT", "7200"))
-DNSX_TIMEOUT = int(os.environ.get("DNSX_TIMEOUT", "3600"))
-HTTPX_TIMEOUT = int(os.environ.get("HTTPX_TIMEOUT", "7200"))
-KATANA_TIMEOUT = int(os.environ.get("KATANA_TIMEOUT", "7200"))
-FEROX_TIMEOUT = int(os.environ.get("FEROX_TIMEOUT", "14400"))
-NUCLEI_TIMEOUT = int(os.environ.get("NUCLEI_TIMEOUT", "14400"))
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -122,19 +128,101 @@ def ai_enabled() -> bool:
     return os.environ.get("AI_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _run_tool(cmd: list[str], timeout: int, **kw) -> subprocess.CompletedProcess | None:
-    """Run a tool with a generous timeout; on timeout keep partial output + warn.
-
-    The caller typically passes stdout=<file>, so partial content survives a
-    TimeoutExpired. We warn and return None so the phase continues instead of
-    failing the whole domain.
-    """
+def _file_size(path: Path) -> int:
+    """Size of a file in bytes, or 0 if it does not exist yet."""
     try:
-        return subprocess.run(cmd, timeout=timeout, **kw)
-    except subprocess.TimeoutExpired:
-        print(f"[!] {cmd[0]} timed out after {timeout}s — keeping partial results",
-              file=sys.stderr)
-        return None
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _write_status(status_file: Path | None, phase: str, tool: str,
+                  elapsed_s: float, size: int, last_growth_s: float) -> None:
+    """Write a best-effort status heartbeat (never raises)."""
+    if status_file is None:
+        return
+    try:
+        status_file.write_text(json.dumps({
+            "phase": phase,
+            "tool": tool,
+            "elapsed_s": int(elapsed_s),
+            "bytes": int(size),
+            "last_growth_s": int(last_growth_s),
+        }))
+    except Exception:
+        pass
+
+
+def _run_tool(cmd: list[str], out_file: Path, stall: int, phase: str = "",
+              status_file: Path | None = None, **kw) -> subprocess.CompletedProcess | None:
+    """Run a tool with a progress-based hang guard instead of a clock.
+
+    The tool is killed only when ``out_file`` stops growing for ``stall``
+    seconds, or after the ABSOLUTE_TIMEOUT last-resort ceiling. Partial output
+    survives because ``out_file`` is opened here and used as stdout. A status
+    heartbeat is written to ``status_file`` every ~30s so long "low and slow"
+    scans stay observable. Returns None when a guard fires.
+    """
+    tool = Path(cmd[0]).name
+    start = time.time()
+    last_size = 0
+    last_growth = start
+    last_status = 0.0
+
+    stdin_text = kw.pop("input", None)
+    stdout_dest = kw.pop("stdout", None)
+    if stdin_text is not None:
+        kw.setdefault("stdin", subprocess.PIPE)
+
+    with out_file.open("w") as out_fh:
+        proc = subprocess.Popen(cmd, stdout=stdout_dest if stdout_dest is not None else out_fh, **kw)
+        if stdin_text is not None:
+            def _feed() -> None:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_feed, daemon=True).start()
+
+        while True:
+            try:
+                rc = proc.wait(timeout=POLL_INTERVAL)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                elapsed = time.time() - start
+                size = _file_size(out_file)
+                _write_status(status_file, phase, tool, elapsed, size,
+                              time.time() - last_growth)
+                return subprocess.CompletedProcess(cmd, rc, None, None)
+
+            elapsed = time.time() - start
+            size = _file_size(out_file)
+            if size > last_size:
+                last_size = size
+                last_growth = time.time()
+            since_growth = time.time() - last_growth
+
+            if status_file is not None and time.time() - last_status >= STATUS_INTERVAL:
+                _write_status(status_file, phase, tool, elapsed, size, since_growth)
+                last_status = time.time()
+
+            if since_growth >= stall:
+                proc.kill()
+                proc.wait()
+                print(f"[!] {tool} stalled for {stall}s — killing, keeping partial results",
+                      file=sys.stderr)
+                _write_status(status_file, phase, tool, elapsed, size, since_growth)
+                return None
+
+            if elapsed >= ABSOLUTE_TIMEOUT:
+                proc.kill()
+                proc.wait()
+                print(f"[!] {tool} hit absolute ceiling {ABSOLUTE_TIMEOUT}s — killing, "
+                      f"keeping partial results", file=sys.stderr)
+                _write_status(status_file, phase, tool, elapsed, size, since_growth)
+                return None
 
 
 def docker_exec(*args: str, stdin_text: str | None = None, timeout: int | None = None,
@@ -321,8 +409,8 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     ).stdout.strip()
     _run_tool(
         ["docker", "exec", "-i", CONTAINER, "subfinder", "-d", domain, "-silent"],
-        SUBFINDER_TIMEOUT,
-        stdout=(d / "subfinder.txt").open("w"), stderr=subprocess.DEVNULL,
+        out_file=d / "subfinder.txt", stall=STALL_SUBFINDER, phase="discover",
+        status_file=d / "status.json", stderr=subprocess.DEVNULL,
     )
     (d / "root_domain.txt").write_text(domain + "\n")
 
@@ -340,8 +428,8 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     _run_tool(
         ["docker", "exec", "-i", CONTAINER, "dnsx", "-d", domain,
          "-w", "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt", "-silent"],
-        DNSX_TIMEOUT,
-        stdout=(d / "dnsx_brute.txt").open("w"), stderr=subprocess.DEVNULL,
+        out_file=d / "dnsx_brute.txt", stall=STALL_DNSX, phase="discover",
+        status_file=d / "status.json", stderr=subprocess.DEVNULL,
     )
 
     # Merge + sanitize all subdomain sources: lowercase, drop cert-log noise
@@ -375,8 +463,8 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     _run_tool(
         ["docker", "exec", "-i", CONTAINER, "dnsx",
          "-l", f"/app/output/{domain}/monthly/all_subdomains.txt", "-silent"],
-        DNSX_TIMEOUT,
-        stdout=(d / "resolved_subdomains.txt").open("w"), stderr=subprocess.DEVNULL,
+        out_file=d / "resolved_subdomains.txt", stall=STALL_DNSX, phase="discover",
+        status_file=d / "status.json", stderr=subprocess.DEVNULL,
     )
 
     # httpx liveness (tech-detect + CDN detection feed synthesis + WAF envelope)
@@ -385,7 +473,8 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
          "-list", f"/app/output/{domain}/monthly/resolved_subdomains.txt",
          "-td", "-cdn", *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
          "-o", f"/app/output/{domain}/monthly/live_hosts.json"],
-        HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
+        out_file=d / "live_hosts.json", stall=STALL_HTTPX, phase="discover",
+        status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     docker_exec_bash(
         f"cat /app/output/{domain}/monthly/live_hosts.json | "
@@ -416,7 +505,8 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
              "-list", f"/app/output/{domain}/monthly/suggested_subs.txt",
              *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
              "-o", f"/app/output/{domain}/monthly/suggested_live.json"],
-            HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
+            out_file=d / "suggested_live.json", stall=STALL_HTTPX, phase="discover",
+            status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         docker_exec_bash(
             f"cat /app/output/{domain}/monthly/suggested_live.json 2>/dev/null | "
@@ -443,16 +533,26 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     live = line_count(d / "live_subdomains.txt")
 
     # Weekly: keep only hosts new since the previous baseline (compare hostnames)
+    new_count = 0
+    removed_count = 0
     if mode == "weekly":
         known = set()
         if (d / "baseline_prev.txt").is_file():
             known = {_host_of(x) for x in (d / "baseline_prev.txt").read_text().splitlines() if x}
-        new_hosts = [l for l in (d / "live_subdomains.txt").read_text().splitlines()
-                     if l and _host_of(l) not in known]
+        live_lines = [l for l in (d / "live_subdomains.txt").read_text().splitlines() if l]
+        live_hosts = {_host_of(l) for l in live_lines}
+        new_hosts = [l for l in live_lines if _host_of(l) not in known]
+        new_names = [_host_of(l) for l in new_hosts]
+        removed_hosts = sorted(h for h in known if h not in live_hosts)
         (d / "live_subdomains.txt").write_text("\n".join(new_hosts) + ("\n" if new_hosts else ""))
         (d / "new_hosts.txt").write_text("\n".join(new_hosts) + ("\n" if new_hosts else ""))
+        (d / "removed_hosts.txt").write_text("\n".join(removed_hosts) + ("\n" if removed_hosts else ""))
+        delta = ([f"new: {len(new_hosts)}"] + new_names
+                 + [f"removed: {len(removed_hosts)}"] + removed_hosts)
+        (d / "weekly_delta.txt").write_text("\n".join(delta) + "\n")
         live = len(new_hosts)
-        print(f"[*] Weekly: {live} new hosts since baseline")
+        new_count, removed_count = len(new_hosts), len(removed_hosts)
+        print(f"[*] Weekly: {new_count} new, {removed_count} removed since baseline")
 
     # Tech summary (feeds endpoint permutation)
     tech = docker_exec_bash(
@@ -463,7 +563,7 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     )
     (d / "tech_summary.txt").write_text(tech.stdout)
 
-    return {"subs": subs, "live": live}
+    return {"subs": subs, "live": live, "new": new_count, "removed": removed_count}
 
 
 def phase_surface(domain: str, d: Path, mode: str) -> int:
@@ -485,7 +585,8 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
          "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
          "-jc", "-d", str(KATANA_DEPTH), "-c", "5", "--delay", "2", "-silent",
          "-o", f"/app/output/{domain}/monthly/katana_urls.txt"],
-        KATANA_TIMEOUT, stderr=subprocess.DEVNULL,
+        out_file=d / "katana_urls.txt", stall=STALL_KATANA, phase="surface",
+        status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
     # gau (bounded)
@@ -523,14 +624,18 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
              "--rate-limit", FEROX_RATE_LIMIT, "--random-agent", "--json", "-t", "10",
              "-w", "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
              "-n", "-o", f"/app/output/{domain}/monthly/ferox_results_full.json"],
-            FEROX_TIMEOUT, input="\n".join(targets), text=True, stderr=subprocess.DEVNULL,
+            out_file=d / "ferox_results_full.json", stall=STALL_FEROX, phase="surface",
+            status_file=d / "status.json",
+            input="\n".join(targets), text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         _run_tool(
             ["docker", "exec", "-i", CONTAINER, "feroxbuster", "--stdin",
              "--rate-limit", FEROX_RATE_LIMIT, "--random-agent", "--json", "-t", "10",
              "-w", "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
              "--depth", "2", "-o", f"/app/output/{domain}/monthly/ferox_results_deep.json"],
-            FEROX_TIMEOUT, input="\n".join(targets[:10]), text=True, stderr=subprocess.DEVNULL,
+            out_file=d / "ferox_results_deep.json", stall=STALL_FEROX, phase="surface",
+            status_file=d / "status.json",
+            input="\n".join(targets[:10]), text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
     # Comprehensive URL set (ferox contributes only on monthly)
@@ -575,7 +680,8 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
              "-list", f"/app/output/{domain}/monthly/suggested_endpoints.txt",
              *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
              "-o", f"/app/output/{domain}/monthly/endpoints_live.json"],
-            HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
+            out_file=d / "endpoints_live.json", stall=STALL_HTTPX, phase="surface",
+            status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         docker_exec_bash(
             f"cat /app/output/{domain}/monthly/endpoints_live.json 2>/dev/null | "
@@ -648,7 +754,8 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
     print("[*] Phase 3: Vulnerability Scan")
     if mode == "monthly":
         _run_tool(["docker", "exec", "-i", CONTAINER, "nuclei", "-update-templates", "-silent"],
-                  NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL)
+                  out_file=d / "nuclei_update.log", stall=STALL_NUCLEI, phase="vuln",
+                  status_file=d / "status.json", stderr=subprocess.DEVNULL)
 
     hdrs = [h.format(domain=domain) for h in WAF_BYPASS_HEADERS]
     header_args = []
@@ -662,7 +769,8 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
          "-list", f"/app/output/{domain}/monthly/high_value_targets.txt",
          "-t", *NUCLEI_TARGETED_TEMPLATES.split(), "-severity", "critical,high",
          *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_targeted.json"],
-        NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL,
+        out_file=d / "nuclei_targeted.json", stall=STALL_NUCLEI, phase="vuln",
+        status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     (d / "nuclei_targeted.json").touch()
 
@@ -673,7 +781,8 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
              "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
              "-t", *NUCLEI_BROAD_TEMPLATES.split(), "-severity", "critical",
              *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_broad.json"],
-            NUCLEI_TIMEOUT, stderr=subprocess.DEVNULL,
+            out_file=d / "nuclei_broad.json", stall=STALL_NUCLEI, phase="vuln",
+            status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         (d / "nuclei_broad.json").touch()
 
@@ -792,7 +901,8 @@ def run_domain(domain: str, mode: str, force: bool) -> None:
         elapsed = time.time() - start
         alert(f"[Spice Harvester {mode}] {target} done in {elapsed:.0f}s — "
               f"{stats['subs']} subs / {stats['live']} live / {urls} URLs / "
-              f"{vuln['nuclei']} nuclei / {vuln['js']} js")
+              f"{vuln['nuclei']} nuclei / {vuln['js']} js / "
+              f"{stats.get('new', 0)} new / {stats.get('removed', 0)} removed")
         log(f"{mode.upper()} DONE — {target}: {stats['subs']} subs, {stats['live']} live, "
             f"{urls} URLs, {vuln['nuclei']} nuclei — {elapsed:.0f}s")
 
