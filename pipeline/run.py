@@ -69,6 +69,13 @@ HTTPX_THREADS = os.environ.get("HTTPX_THREADS", "20")
 FEROX_RATE_LIMIT = os.environ.get("FEROX_RATE_LIMIT", "10")
 NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "5")
 
+# Optional TLS client-hello (JA3) randomization — evades Go-fingerprint bot
+# detection. Experimental: enable with TLS_IMPERSONATE=1 for bot-walled targets.
+TLS_IMPERSONATE_FLAGS = (
+    ["-tlsi"] if os.environ.get("TLS_IMPERSONATE", "").strip().lower() in ("1", "true", "yes", "on")
+    else []
+)
+
 # Generous tool timeouts (seconds) — hang-guards, not truncation targets. On
 # timeout the pipeline keeps partial results and warns instead of failing.
 SUBFINDER_TIMEOUT = int(os.environ.get("SUBFINDER_TIMEOUT", "7200"))
@@ -376,7 +383,7 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     _run_tool(
         ["docker", "exec", "-i", CONTAINER, "httpx",
          "-list", f"/app/output/{domain}/monthly/resolved_subdomains.txt",
-         "-td", "-cdn", "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+         "-td", "-cdn", *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
          "-o", f"/app/output/{domain}/monthly/live_hosts.json"],
         HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
     )
@@ -407,7 +414,7 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
         _run_tool(
             ["docker", "exec", "-i", CONTAINER, "httpx",
              "-list", f"/app/output/{domain}/monthly/suggested_subs.txt",
-             "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+             *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
              "-o", f"/app/output/{domain}/monthly/suggested_live.json"],
             HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
         )
@@ -566,7 +573,7 @@ def phase_surface(domain: str, d: Path, mode: str) -> int:
         _run_tool(
             ["docker", "exec", "-i", CONTAINER, "httpx",
              "-list", f"/app/output/{domain}/monthly/suggested_endpoints.txt",
-             "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
+             *TLS_IMPERSONATE_FLAGS, "-t", HTTPX_THREADS, "-rl", HTTPX_RATE_LIMIT, "-silent", "-json",
              "-o", f"/app/output/{domain}/monthly/endpoints_live.json"],
             HTTPX_TIMEOUT, stderr=subprocess.DEVNULL,
         )
@@ -647,7 +654,7 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
     header_args = []
     for h in hdrs:
         header_args += ["-H", h]
-    nuclei_args = ["-rl", NUCLEI_RATE_LIMIT, "-bs", "2", "-c", "5", "-silent", "-jsonl"] + header_args
+    nuclei_args = ["-rl", NUCLEI_RATE_LIMIT, *TLS_IMPERSONATE_FLAGS, "-bs", "2", "-c", "5", "-silent", "-jsonl"] + header_args
 
     # Pass 1: targeted (high-value, critical+high)
     _run_tool(
