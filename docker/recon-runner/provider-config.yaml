@@ -1,0 +1,94 @@
+# Spice Harvester subfinder provider config
+# API key slots for free-tier passive enumeration sources.
+# Fill in your keys below — all sources have free tiers.
+# Docs: https://github.com/projectdiscovery/subfinder#post-installation-instructions
+
+# ── High-impact free sources (fill these first) ──
+# crt.sh — no key needed, but rate-limited on VPN IPs. Leave empty.
+# certspotter — no key needed, but benefits from clean IP
+
+# SecurityTrails — 50 req/month free: https://securitytrails.com/app/signup
+securitytrails: []
+
+# AlienVault OTX — unlimited free: https://otx.alienvault.com/signup
+alienvault: []
+
+# Chaos (ProjectDiscovery) — unlimited free: https://cloud.projectdiscovery.io
+chaos: []
+
+# Shodan — free tier: https://account.shodan.io/register
+shodan: []
+
+# Censys — 250 queries/month free: https://search.censys.io/register
+censys: []
+
+# URLScan — free tier: https://urlscan.io/user/signup
+urlscan: []
+
+# VirusTotal — 500 req/day free: https://www.virustotal.com/gui/join-us
+virustotal: []
+
+# ── Medium-impact (fill if you have accounts) ──
+
+# BeVigil (CloudSek) — free tier: https://bevigil.com/signup
+bevigil: []
+
+# BufferOver — free tier: https://tls.bufferover.run/signup
+bufferover: []
+
+# BuiltWith — free tier: https://builtwith.com/signup
+builtwith: []
+
+# DNSDB (Farsight) — free tier available: https://www.farsightsecurity.com/signup
+dnsdb: []
+
+# DNSDumpster — free: https://dnsdumpster.com/signup
+dnsdumpster: []
+
+# DNSRepo — free: https://dnsrepo.noc.org/signup
+dnsrepo: []
+
+# FullHunt — free tier: https://fullhunt.io/signup
+fullhunt: []
+
+# GitHub — requires token with no scopes: https://github.com/settings/tokens
+github: []
+
+# IntelX — free tier: https://intelx.io/signup
+intelx: []
+
+# LeakIX — free tier: https://leakix.net/signup
+leakix: []
+
+# Netlas — free tier (50 req/day): https://app.netlas.io/signup
+netlas: []
+
+# Onyphe — free tier: https://www.onyphe.io/signup
+onyphe: []
+
+# Shodan InternetDB — free, no key needed. Leave empty.
+
+# WhoIsXMLAPI — free tier: https://whois.whoisxmlapi.com/signup
+whoisxmlapi: []
+
+# Zoomeye — free tier: https://www.zoomeye.org/signup
+zoomeyeapi: []
+
+# ── Low-impact / no free tier (fill only if you have paid accounts) ──
+c99: []
+chinaz: []
+digitalyama: []
+driftnet: []
+fofa: []
+hackertarget: []
+merklemap: []
+profundis: []
+pugrecon: []
+quake: []
+reconeer: []
+redhuntlabs: []
+robtex: []
+rsecloud: []
+submd: []
+threatbook: []
+windvane: []

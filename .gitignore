@@ -1,0 +1,46 @@
+# Secrets
+.env
+wg0.conf
+*.pem
+*.key
+/run/secrets/
+
+# Pipeline output
+pipeline/output*/
+target_knowledge.json
+
+# Docker volumes
+neo4j_data/
+redis_data/
+signal_data/
+ptai_data/
+wordlists/
+
+# Nix
+result
+.direnv/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# But keep scope tracking
+!scope.txt
+
+# Hermes state (not part of repo)
+.hermes/
+
+# ── Internal (not for the public open-source repo) ──
+archive/
+plans/
+hermes-skills/
+.github/
+docs/plans/
+docs/gungnir-integration-brainstorm.md
+docs/IMPLEMENTATION-GUIDE.md
+scripts/gungnir-watchdog.sh

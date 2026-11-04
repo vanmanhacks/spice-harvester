@@ -1,0 +1,57 @@
+# Spice Harvester Docker Compose Stack
+# ─── Tailscale Mullvad exit node + Squid Warden proxy ───
+# Recon-runner uses network_mode: "host" to inherit the
+# host's Tailscale exit node routing (via tailscale0). Internet traffic
+# is locked to the Mullvad exit node via `tailscale set --exit-node`.
+# LAN traffic (RFC1918) bypasses the exit node for local DNS/SSH.
+# Kill switch: `tailscale set --exit-node-allow-lan-access=false` —
+# if Mullvad drops, internet traffic stops; LAN still reachable.
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  # ─── Squid Warden: Rate Limiting + Scope Enforcement ───
+  warden:
+    image: ubuntu/squid:latest
+    container_name: spice-harvester-warden
+    network_mode: "host"
+    volumes:
+      - ./docker/warden/squid.conf:/etc/squid/squid.conf:ro
+      - ./scope.txt:/app/scope.txt:ro
+    logging: *default-logging
+
+  # ─── Recon Runner: Security Tools Container ───
+  recon-runner:
+    build:
+      context: ./docker/recon-runner
+      dockerfile: Dockerfile
+    container_name: spice-harvester-recon-runner
+    network_mode: "host"
+    environment:
+      - HTTP_PROXY=http://127.0.0.1:3128
+      - HTTPS_PROXY=http://127.0.0.1:3128
+      - http_proxy=http://127.0.0.1:3128
+      - https_proxy=http://127.0.0.1:3128
+      - NO_PROXY=localhost,127.0.0.1
+    volumes:
+      - ./pipeline/output:/app/output
+      - ./pipeline/scripts:/app/scripts:ro
+      - ./scope.txt:/app/scope.txt:ro
+      - wordlists:/app/wordlists
+    depends_on:
+      warden:
+        condition: service_started
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    logging: *default-logging
+    command: ["tail", "-f", "/dev/null"]
+
+volumes:
+  wordlists:
+    external: true

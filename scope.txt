@@ -1,0 +1,13 @@
+# Spice Harvester Scope — Bug Bounty Targets
+# Format: one domain per line. *. prefix = all subdomains.
+# Out-of-scope exclusions: comma-separated after "# Out of scope:"
+
+# --- Test target (self-hosted / permissive, validates pipeline end-to-end) ---
+gitlab.com
+*.gitlab.com
+# Out of scope: customers.gitlab.com, license.gitlab.com
+
+# --- WAF-enveloped targets (WAF_SKIP optimization applies) ---
+tesla.com
+*.teslamotors.com
+# Out of scope: employeefeedback.tesla.com, energysupport.tesla.com, engage.tesla.com, feedback.tesla.com, ir.tesla.com, mkto.teslamotors.com, shop.eu.teslamotors.com, service.tesla.com/docs/*, maxwell.com, superchargers
