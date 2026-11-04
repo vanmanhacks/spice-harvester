@@ -348,6 +348,14 @@ def phase_discover(domain: str, d: Path, mode: str) -> dict:
     )
     subs = line_count(d / "all_subdomains.txt")
 
+    # Domain-boundary filter: keep only hosts inside the in-scope root domain.
+    # crt.sh SAN entries (e.g. m.testexample.com on a *.example.com scan) leak
+    # in via cert transparency and would otherwise be probed out of scope.
+    _kept = [s for s in (d / "all_subdomains.txt").read_text().splitlines()
+             if s == domain or s.endswith(f".{domain}")]
+    (d / "all_subdomains.txt").write_text("\n".join(_kept) + ("\n" if _kept else ""))
+    subs = len(_kept)
+
     # Kill dnsmasq
     docker_exec_bash(
         'for p in /proc/[0-9]*; do [ -f "$p/comm" ] && [ "$(cat "$p/comm")" = dnsmasq ] '
