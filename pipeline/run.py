@@ -50,7 +50,8 @@ NUCLEI_TARGETED_TEMPLATES = (
     "/root/nuclei-templates/http/exposures/"
 )
 NUCLEI_BROAD_TEMPLATES = (
-    "/root/nuclei-templates/http/cves/ /root/nuclei-templates/http/exposed-panels/ "
+    "/root/nuclei-templates/http/cves/2025/ /root/nuclei-templates/http/cves/2026/ "
+    "/root/nuclei-templates/http/exposed-panels/ "
     "/root/nuclei-templates/http/misconfiguration/"
 )
 GF_PATTERNS = "xss sqli ssrf lfi redirect idor debug-pages upload-fields s3-buckets"
@@ -758,7 +759,7 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
     # Clear stale per-run artifacts (weekly must not inherit monthly's broad scan)
     for name in ("nuclei_targeted.json", "nuclei_broad.json", "nuclei_results.json",
                  "nuclei_targeted.progress.log", "nuclei_broad.progress.log",
-                 "js_urls.txt", "api_candidates.txt"):
+                 "js_urls.txt", "api_candidates.txt", "broad_targets.txt"):
         p = d / name
         if p.is_file():
             p.unlink()
@@ -788,11 +789,19 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
     )
     (d / "nuclei_targeted.json").touch()
 
-    # Pass 2: broad (all live, critical) — monthly only
+    # Pass 2: broad (deduped backends, critical) — monthly only
     if mode == "monthly":
+        # Collapse CDN-fronted aliases to one representative per backend so the
+        # host × template cross-product stays bounded on large estates.
+        r = host_python("dedup_hosts.py", stdin_text=(d / "live_hosts.json").read_text())
+        (d / "broad_targets.txt").write_text(r.stdout)
+        broad_list = (
+            d / "broad_targets.txt"
+            if line_count(d / "broad_targets.txt") > 0 else d / "live_subdomains.txt"
+        )
         _run_tool(
             ["docker", "exec", "-i", CONTAINER, "nuclei",
-             "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
+             "-list", f"/app/output/{domain}/monthly/{broad_list.name}",
              "-t", *NUCLEI_BROAD_TEMPLATES.split(), "-severity", "critical",
              *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_broad.json"],
             out_file=d / "nuclei_broad.json", liveness_file=d / "nuclei_broad.progress.log",
