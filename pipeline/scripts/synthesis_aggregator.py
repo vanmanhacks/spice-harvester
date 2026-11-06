@@ -83,6 +83,7 @@ def extract_hosts(run_dir: Path) -> dict:
         "live_urls": [],
         "host_count": 0,
         "tech_stacks": defaultdict(int),
+        "host_tech": {},
         "titles": [],
         "servers": [],
     }
@@ -96,11 +97,11 @@ def extract_hosts(run_dir: Path) -> dict:
             result["live_urls"].append(url)
 
         tech = host.get("tech", host.get("technology", []))
-        if isinstance(tech, list):
-            for t in tech:
-                result["tech_stacks"][t] += 1
-        elif isinstance(tech, str):
-            result["tech_stacks"][tech] += 1
+        tech_list = tech if isinstance(tech, list) else ([tech] if isinstance(tech, str) else [])
+        for t in tech_list:
+            result["tech_stacks"][t] += 1
+        if url and tech_list:
+            result["host_tech"][url] = tech_list
 
         title = host.get("title", "")
         if title:
@@ -244,6 +245,47 @@ def extract_gf_matches(run_dir: Path) -> dict:
     }
 
 
+def extract_nuclei(run_dir: Path) -> dict:
+    """Extract nuclei findings (CVE/version/template matches) from the vuln scan."""
+    result = {
+        "scanned": False,
+        "total_findings": 0,
+        "severity_counts": {},
+        "top_templates": {},
+        "finding_samples": [],
+    }
+    findings = safe_load_json_lines(run_dir / "nuclei_results.json")
+    if not findings:
+        return result
+
+    result["scanned"] = True
+    result["total_findings"] = len(findings)
+
+    severities = defaultdict(int)
+    templates = defaultdict(int)
+    samples = []
+    for f in findings:
+        info = f.get("info", {}) if isinstance(f.get("info"), dict) else {}
+        sev = info.get("severity", "unknown")
+        severities[sev] += 1
+        tid = f.get("template-id", "unknown")
+        templates[tid] += 1
+        if len(samples) < 25:
+            samples.append({
+                "template": tid,
+                "severity": sev,
+                "host": f.get("host", ""),
+                "matched_at": f.get("matched-at", ""),
+                "matcher": f.get("matcher-name", ""),
+                "extracted": (f.get("extracted-results") or [])[:3],
+            })
+
+    result["severity_counts"] = dict(sorted(severities.items(), key=lambda x: -x[1]))
+    result["top_templates"] = dict(sorted(templates.items(), key=lambda x: -x[1])[:25])
+    result["finding_samples"] = samples
+    return result
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: synthesis_aggregator.py <pipeline_run_dir>", file=sys.stderr)
@@ -262,6 +304,7 @@ def main():
         "parameters": extract_parameters(run_dir),
         "js_findings": extract_js_findings(run_dir),
         "vulnerability_patterns": extract_gf_matches(run_dir),
+        "nuclei_findings": extract_nuclei(run_dir),
     }
 
     # Add summary stats
@@ -272,6 +315,7 @@ def main():
         "parameters_discovered": output["parameters"]["parameters_found"],
         "js_files_scanned": output["js_findings"].get("files_scanned", 0),
         "vulnerability_matches": output["vulnerability_patterns"].get("total_matches", 0),
+        "nuclei_findings": output["nuclei_findings"].get("total_findings", 0),
     }
 
     outfile = run_dir / "synthesis_input.json"
@@ -285,6 +329,7 @@ def main():
     print(f"    Parameters: {output['summary']['parameters_discovered']}")
     print(f"    JS files: {output['summary']['js_files_scanned']}")
     print(f"    Vuln patterns: {output['summary']['vulnerability_matches']}")
+    print(f"    Nuclei findings: {output['summary']['nuclei_findings']}")
 
 
 if __name__ == "__main__":
