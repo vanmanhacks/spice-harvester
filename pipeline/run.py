@@ -68,7 +68,7 @@ WAF_BYPASS_HEADERS = [
 HTTPX_RATE_LIMIT = os.environ.get("HTTPX_RATE_LIMIT", "20")
 HTTPX_THREADS = os.environ.get("HTTPX_THREADS", "20")
 FEROX_RATE_LIMIT = os.environ.get("FEROX_RATE_LIMIT", "10")
-NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "5")
+NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "15")
 
 # Progress-based hang guards (seconds of no output growth before a tool is
 # killed) — replaces wall-clock timeouts so monthly scans can run "low and
@@ -76,7 +76,7 @@ NUCLEI_RATE_LIMIT = os.environ.get("NUCLEI_RATE_LIMIT", "5")
 # ABSOLUTE_TIMEOUT last-resort ceiling. Partial output is always kept.
 STALL_HTTPX = int(os.environ.get("STALL_HTTPX", "600"))
 STALL_FEROX = int(os.environ.get("STALL_FEROX", "600"))
-STALL_NUCLEI = int(os.environ.get("STALL_NUCLEI", "600"))
+STALL_NUCLEI = int(os.environ.get("STALL_NUCLEI", "3600"))
 STALL_KATANA = int(os.environ.get("STALL_KATANA", "600"))
 STALL_SUBFINDER = int(os.environ.get("STALL_SUBFINDER", "1200"))
 STALL_DNSX = int(os.environ.get("STALL_DNSX", "1200"))
@@ -154,12 +154,16 @@ def _write_status(status_file: Path | None, phase: str, tool: str,
 
 
 def _run_tool(cmd: list[str], out_file: Path, stall: int, phase: str = "",
-              status_file: Path | None = None, **kw) -> subprocess.CompletedProcess | None:
+              status_file: Path | None = None, liveness_file: Path | None = None,
+              **kw) -> subprocess.CompletedProcess | None:
     """Run a tool with a progress-based hang guard instead of a clock.
 
-    The tool is killed only when ``out_file`` stops growing for ``stall``
+    The tool is killed only when the watched output stops growing for ``stall``
     seconds, or after the ABSOLUTE_TIMEOUT last-resort ceiling. Partial output
-    survives because ``out_file`` is opened here and used as stdout. A status
+    survives because ``out_file`` is opened here and used as stdout. By default
+    the watched output is ``out_file``; pass ``liveness_file`` for tools like
+    nuclei whose results file only grows on findings — their stderr progress is
+    captured there so a still-working scan is not misread as stalled. A status
     heartbeat is written to ``status_file`` every ~30s so long "low and slow"
     scans stay observable. Returns None when a guard fires.
     """
@@ -168,14 +172,21 @@ def _run_tool(cmd: list[str], out_file: Path, stall: int, phase: str = "",
     last_size = 0
     last_growth = start
     last_status = 0.0
+    watch = liveness_file if liveness_file is not None else out_file
 
     stdin_text = kw.pop("input", None)
     stdout_dest = kw.pop("stdout", None)
+    liveness_fh = None
+    if liveness_file is not None:
+        liveness_fh = liveness_file.open("w")
+        kw["stderr"] = liveness_fh
     if stdin_text is not None:
         kw.setdefault("stdin", subprocess.PIPE)
 
     with out_file.open("w") as out_fh:
         proc = subprocess.Popen(cmd, stdout=stdout_dest if stdout_dest is not None else out_fh, **kw)
+        if liveness_fh is not None:
+            liveness_fh.close()
         if stdin_text is not None:
             def _feed() -> None:
                 try:
@@ -192,13 +203,13 @@ def _run_tool(cmd: list[str], out_file: Path, stall: int, phase: str = "",
                 pass
             else:
                 elapsed = time.time() - start
-                size = _file_size(out_file)
+                size = _file_size(watch)
                 _write_status(status_file, phase, tool, elapsed, size,
                               time.time() - last_growth)
                 return subprocess.CompletedProcess(cmd, rc, None, None)
 
             elapsed = time.time() - start
-            size = _file_size(out_file)
+            size = _file_size(watch)
             if size > last_size:
                 last_size = size
                 last_growth = time.time()
@@ -746,6 +757,7 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
 
     # Clear stale per-run artifacts (weekly must not inherit monthly's broad scan)
     for name in ("nuclei_targeted.json", "nuclei_broad.json", "nuclei_results.json",
+                 "nuclei_targeted.progress.log", "nuclei_broad.progress.log",
                  "js_urls.txt", "api_candidates.txt"):
         p = d / name
         if p.is_file():
@@ -761,7 +773,8 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
     header_args = []
     for h in hdrs:
         header_args += ["-H", h]
-    nuclei_args = ["-rl", NUCLEI_RATE_LIMIT, *TLS_IMPERSONATE_FLAGS, "-bs", "2", "-c", "5", "-silent", "-jsonl"] + header_args
+    nuclei_args = ["-rl", NUCLEI_RATE_LIMIT, *TLS_IMPERSONATE_FLAGS, "-bs", "2", "-c", "5",
+                  "-silent", "-jsonl", "-stats", "-stats-interval", "15"] + header_args
 
     # Pass 1: targeted (high-value, critical+high)
     _run_tool(
@@ -769,8 +782,9 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
          "-list", f"/app/output/{domain}/monthly/high_value_targets.txt",
          "-t", *NUCLEI_TARGETED_TEMPLATES.split(), "-severity", "critical,high",
          *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_targeted.json"],
-        out_file=d / "nuclei_targeted.json", stall=STALL_NUCLEI, phase="vuln",
-        status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        out_file=d / "nuclei_targeted.json", liveness_file=d / "nuclei_targeted.progress.log",
+        stall=STALL_NUCLEI, phase="vuln",
+        status_file=d / "status.json", stdout=subprocess.DEVNULL,
     )
     (d / "nuclei_targeted.json").touch()
 
@@ -781,8 +795,9 @@ def phase_vuln(domain: str, d: Path, waf_enveloped: bool, mode: str) -> dict:
              "-list", f"/app/output/{domain}/monthly/live_subdomains.txt",
              "-t", *NUCLEI_BROAD_TEMPLATES.split(), "-severity", "critical",
              *nuclei_args, "-o", f"/app/output/{domain}/monthly/nuclei_broad.json"],
-            out_file=d / "nuclei_broad.json", stall=STALL_NUCLEI, phase="vuln",
-            status_file=d / "status.json", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            out_file=d / "nuclei_broad.json", liveness_file=d / "nuclei_broad.progress.log",
+            stall=STALL_NUCLEI, phase="vuln",
+            status_file=d / "status.json", stdout=subprocess.DEVNULL,
         )
         (d / "nuclei_broad.json").touch()
 
